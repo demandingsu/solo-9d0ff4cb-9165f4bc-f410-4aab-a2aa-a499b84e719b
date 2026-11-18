@@ -144,8 +144,12 @@ def get_read_conn() -> Iterator[sqlite3.Connection]:
     except sqlite3.OperationalError:
         conn = _connect()
     try:
+        # 显式开启读事务：同一请求内的多次查询（状态、计数、明细）取自同一个
+        # WAL 快照，避免发布换版恰好发生在两次查询之间而返回混合状态。
+        conn.execute("BEGIN")
         yield conn
     finally:
+        conn.rollback()
         conn.close()
 
 

@@ -72,7 +72,13 @@ class PublishResponse(BaseModel):
     catch_up_seq: int
     outlet_count: int
     active_count: int
-    changes_applied: int
+    changes_applied: int = Field(
+        description="窗口 (source_cutoff_seq, catch_up_seq] 内重放生效的变更条数"
+    )
+    changes_reconciled: int = Field(
+        default=0,
+        description="序号 ≤ source_cutoff_seq 且被新快照覆盖、本次对齐为已应用的旧变更条数",
+    )
 
 
 class OutletOut(BaseModel):

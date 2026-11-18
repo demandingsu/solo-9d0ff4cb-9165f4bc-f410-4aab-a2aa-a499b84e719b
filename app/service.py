@@ -4,8 +4,8 @@
 1. 同一时刻只有一个 open 批次；已发布版本与暂存区物理隔离。
 2. 分片按 (batch_id, shard_no)、变更按 seq 做内容哈希幂等，同内容重试只生效一次，异内容冲突。
 3. 变更序号必须连续，缺口之后的变更拒绝写入；已供出水位 last_served_seq 单调不减。
-4. 发布在单事务内完成：建新版排口 -> 套用窗口变更 -> 续套水位外变更 -> 删旧版 -> 推进水位，
-   任一步失败整体回滚，旧版照常供数。
+4. 发布在单事务内完成：建新版排口 -> 套用窗口变更 -> 对齐快照已覆盖的旧变更状态
+   -> 续套水位外变更 -> 删旧版 -> 推进水位，任一步失败整体回滚，旧版照常供数。
 """
 from __future__ import annotations
 
@@ -184,6 +184,35 @@ def _replay_window(conn: sqlite3.Connection, version: int, cutoff: int, target: 
             (version, ch["id"]),
         )
     return len(window)
+
+
+def _reconcile_snapshot_covered(conn: sqlite3.Connection, version: int, cutoff: int) -> int:
+    """发布时对齐“已被新快照覆盖”的变更状态。
+
+    来源截止序号 <= cutoff 的变更，按契约已被快照本身包含，不再重放；
+    但它们可能仍停留在旧链的 applied=0/blocked=1（旧快照缺排口导致的断点）
+    或 applied_version=旧版本。若不在这里统一收口，旧断点会继续拦截
+    cutoff 之后的连续变更，导致新排口永远无法供巡查端查询。
+
+    因此这些变更的断点状态必须与新供出水位一致：标记为已应用、清除断点，
+    并归属到新版本。后续序号从干净的链尾继续套用；cutoff 之后真正失败的
+    变更仍会在 _replay_window/_continue_chain_new_version 中被阻断。
+
+    返回本次从“未应用/有断点”收敛为已应用的条数（供发布响应展示）。
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM change_log"
+        " WHERE seq <= ? AND (applied=0 OR blocked=1 OR block_reason IS NOT NULL)",
+        (cutoff,),
+    ).fetchone()
+    reconciled = int(row["c"])
+    conn.execute(
+        "UPDATE change_log"
+        " SET applied=1, applied_version=?, blocked=0, block_reason=NULL"
+        " WHERE seq <= ?",
+        (version, cutoff),
+    )
+    return reconciled
 
 
 def _continue_chain_new_version(conn: sqlite3.Connection, version: int, target: int) -> None:
@@ -501,6 +530,10 @@ def publish_batch(batch_id: int, req: PublishRequest) -> dict:
         # 2) 按序重放截止序号之后、追平目标之内的变更（在新快照上重新生效，含已套旧版的）
         changes_in_window = _replay_window(conn, new_version, cutoff, target)
 
+        # 2a) 截止序号之内、已被新快照覆盖的旧变更：断点/应用状态与新水位对齐。
+        #     这些变更不再重放（快照已含效果），但旧断点不得越过本次发布继续拦截后续序号。
+        reconciled = _reconcile_snapshot_covered(conn, new_version, cutoff)
+
         # 2b) 水位/追平目标之外、但已套到旧版现役清单的高序号变更：
         #     新快照必须已包含其最终效果，否则换版会丢失现役状态，拒绝发布并整体回滚
         beyond = conn.execute(
@@ -557,6 +590,7 @@ def publish_batch(batch_id: int, req: PublishRequest) -> dict:
             "outlet_count": int(counts["total"]),
             "active_count": int(counts["active"] or 0),
             "changes_applied": changes_in_window,
+            "changes_reconciled": reconciled,
         }
 
 

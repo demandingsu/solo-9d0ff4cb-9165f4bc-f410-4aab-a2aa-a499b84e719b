@@ -28,8 +28,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements.txt
-pytest                      # 22 个单元/并发用例
-python3 tests/smoke_http.py # 需先启动服务，26 项 HTTP 端到端检查
+pytest                      # 30 个单元/并发用例
+python3 tests/smoke_http.py # 需先启动服务，42 项 HTTP 端到端检查
 ```
 
 ## 二、核心业务规则
@@ -53,7 +53,12 @@ python3 tests/smoke_http.py # 需先启动服务，26 项 HTTP 端到端检查
 - 序号 ≤ 已供出水位 `last_served_seq` 的补写 → `409 SEQ_REGRESSION`（已发布历史不可改）。
 - **全量上传期间变更照常到达**：合法变更立即套用到现役（旧版）清单，巡查端实时可见。
 - 变更引用的排口不存在时，该序号置 `blocked`，**其后的变更不得越过断点**；
-  待新快照补齐排口并发布时，窗口重放自动解除阻断。
+  待新快照补齐排口并发布时，窗口重放/快照覆盖对齐会自动解除阻断。
+- **快照覆盖旧断点的衔接**：若新全量清单的来源截止序号 `cutoff` 已包含此前停留在
+  `blocked`/未应用状态的变更（序号 ≤ cutoff），发布时把这些变更统一标记为已应用并清除断点、
+  归属新版本。旧断点不会越过本次发布继续拦截 `cutoff` 之后的连续序号；
+  而 `cutoff` 之后真正失败的变更仍会阻断后续序号，等待下一份含其效果的快照。
+- 同序号重试始终返回该变更**当前**的 `applied/blocked/block_reason`（发布对齐后即反映新状态）。
 
 ### 3. 发布切换（原子换版）
 
@@ -69,7 +74,8 @@ python3 tests/smoke_http.py # 需先启动服务，26 项 HTTP 端到端检查
 | 已生效的窗口外高序号变更，快照必须已含其效果 | `422 SNAPSHOT_MISSING_LIVE_CHANGE` |
 
 发布在**单个 IMMEDIATE 事务**内完成：写入新版本快照 → 按序重放窗口 `(cutoff, catch_up_seq]` 内变更
-→ 续跑窗口外未套用变更 → 删除旧版 → 推进版本号与水位 → 关闭批次。
+→ 对齐 `seq ≤ cutoff` 的旧变更状态（清断点、标记已应用）→ 续跑窗口外未套用变更
+→ 删除旧版 → 推进版本号与水位 → 关闭批次。
 任一步失败整体回滚，**旧版照常供数，批次保持 open**（可用 `POST /batches/{id}/abort` 废弃后等下一周期重开）。
 
 ### 4. 查询（始终取同一已提交状态）
@@ -80,7 +86,8 @@ python3 tests/smoke_http.py # 需先启动服务，26 项 HTTP 端到端检查
 - `GET /changes`：变更流、全量缺号列表、阻断信息。
 - `GET /health`：当前版本号与已供出序号水位。
 
-所有读请求走 SQLite 只读连接（WAL 模式），不阻塞写。
+所有读请求走 SQLite 只读连接（WAL 模式），每次请求开启一个读事务，状态/明细/计数取自同一 WAL 快照，
+不阻塞写，也不会出现“半次切换”的混合视图。
 
 ## 三、接口一览
 
@@ -108,9 +115,9 @@ app/
   service.py    # 全部业务规则与事务边界
   main.py       # FastAPI 路由与异常处理
 tests/
-  test_sync_api.py     # 18 个功能用例（含切换交错、失败回滚、阻断续链）
-  test_concurrency.py  # 4 个多线程并发用例（串行化、幂等、序号约束）
-  smoke_http.py        # 针对运行中服务的 26 项 HTTP 冒烟检查
+  test_sync_api.py     # 23 个功能用例（含切换交错、失败回滚、快照覆盖旧断点衔接）
+  test_concurrency.py  # 7 个多线程并发用例（串行化、幂等、序号约束、发布/变更交错）
+  smoke_http.py        # 针对运行中服务的 42 项 HTTP 冒烟检查
 docker-compose.yml / Dockerfile
 ```
 
@@ -120,3 +127,5 @@ docker-compose.yml / Dockerfile
 - **并发控制**：所有写请求 `BEGIN IMMEDIATE` 串行化，配合 `busy_timeout=30s`；读请求只读连接，读写不互斥。
 - **版本隔离**：`outlet` 表带 `version` 字段，发布成功前旧版行不动，切换时同事务删旧插新。
 - **断点不越号**：变更链维护 `blocked/block_reason`，断点之后的变更保持未应用，缺号无法靠后续高序号“跳过”。
+- **快照对齐**：发布时 `seq ≤ source_cutoff_seq` 的变更视为被快照包含，统一 `applied=1, blocked=0` 并归属新版本，
+  使旧断点不会污染新水位之后的链；`cutoff` 之后失败仍按断点阻断。

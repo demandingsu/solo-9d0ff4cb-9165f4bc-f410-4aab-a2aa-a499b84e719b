@@ -126,7 +126,82 @@ s, b = call("POST", f"/batches/{bid3}/publish", {"catch_up_seq": 2})
 check("追平倒退409", s == 409 and b["code"] == "CATCHUP_REGRESSION")
 call("POST", f"/batches/{bid3}/abort")
 
-# 12. /docs 与 openapi
+# 12. 旧断点被新快照覆盖后的衔接：断点/暂挂状态对齐新水位，后续序号照常套用
+s, b = call("POST", "/changes", {"seq": 5, "change_type": "move", "outlet_no": "X2", "district": "Z"})
+check("seq5缺排口形成断点", s == 201 and b["blocked"] is True and b["applied"] is False)
+s, b = call("POST", "/changes", {"seq": 6, "change_type": "add", "outlet_no": "Y2",
+                                  "district": "B", "active": True})
+check("seq6被断点暂挂", s == 201 and b["applied"] is False and b["blocked"] is False)
+
+s, b = call("POST", "/batches", {"total_shards": 1, "source_cutoff_seq": 6})
+bid4 = b["batch_id"]
+call("POST", f"/batches/{bid4}/shards", {"shard_no": 1, "items": [
+    {"outlet_no": "O1", "district": "C", "active": True},
+    {"outlet_no": "O2", "district": "A", "active": False},
+    {"outlet_no": "O3", "district": "B", "active": False},
+    {"outlet_no": "O4", "district": "C", "active": False},
+    {"outlet_no": "O5", "district": "B", "active": True},
+    {"outlet_no": "X2", "district": "Z", "active": True},
+    {"outlet_no": "Y2", "district": "B", "active": True},
+]})
+s, b = call("POST", f"/batches/{bid4}/publish", {"catch_up_seq": 6})
+check("覆盖旧断点的快照发布v3", s == 200 and b["version"] == 3, str(b))
+
+s, changes = call("GET", "/changes")
+by_seq = {c["seq"]: c for c in changes["items"]}
+check("快照覆盖的旧断点已对齐",
+      by_seq[5]["applied"] is True and by_seq[5]["blocked"] is False
+      and by_seq[6]["applied"] is True and by_seq[6]["blocked"] is False)
+
+s, b = call("POST", "/changes", {"seq": 7, "change_type": "add", "outlet_no": "N7",
+                                  "district": "D", "active": True})
+check("后续序号不再被旧断点拦截", s == 201 and b["applied"] is True)
+s, outlets = call("GET", "/outlets?district=D")
+check("新排口供巡查端可见", s == 200 and outlets["count"] == 1
+      and outlets["items"][0]["outlet_no"] == "N7")
+
+s, b = call("POST", "/changes", {"seq": 5, "change_type": "move", "outlet_no": "X2", "district": "Z"})
+check("同序号重试反映当前状态", s == 201 and b["idempotent"] is True
+      and b["applied"] is True and b["blocked"] is False)
+
+# 13. 截止序号之后真正失败的变更仍阻断后续序号
+s, b = call("POST", "/changes", {"seq": 8, "change_type": "move", "outlet_no": "MISSING", "district": "Q"})
+check("seq8真实失败阻断", s == 201 and b["blocked"] is True and b["applied"] is False)
+s, b = call("POST", "/changes", {"seq": 9, "change_type": "add", "outlet_no": "N9",
+                                  "district": "D", "active": True})
+check("seq9不得越过真实断点", s == 201 and b["applied"] is False)
+s, outlets = call("GET", "/outlets?district=D")
+check("断点后续排口未供出", outlets["count"] == 1)
+
+# 14. 发布失败：截止序号之后真正失败的变更令整次换版回滚，旧版/水位/断点保持旧态
+s, b = call("POST", "/batches", {"total_shards": 1, "source_cutoff_seq": 7})
+bid5 = b["batch_id"]
+call("POST", f"/batches/{bid5}/shards", {"shard_no": 1, "items": [
+    {"outlet_no": "O1", "district": "C", "active": True},
+    {"outlet_no": "O2", "district": "A", "active": False},
+    {"outlet_no": "O3", "district": "B", "active": False},
+    {"outlet_no": "O4", "district": "C", "active": False},
+    {"outlet_no": "O5", "district": "B", "active": True},
+    {"outlet_no": "X2", "district": "Z", "active": True},
+    {"outlet_no": "Y2", "district": "B", "active": True},
+    {"outlet_no": "N7", "district": "D", "active": True},
+]})
+s, b = call("POST", f"/batches/{bid5}/publish", {"catch_up_seq": 8})
+check("发布失败422", s == 422 and b["code"] == "PUBLISH_CHANGE_FAILED"
+      and b["details"]["seq"] == 8, str(b))
+s, health = call("GET", "/health")
+check("失败后水位与版本未动", health["version"] == 3 and health["last_served_seq"] == 6)
+s, changes = call("GET", "/changes")
+by_seq = {c["seq"]: c for c in changes["items"]}
+check("失败后断点保持", by_seq[8]["blocked"] is True and by_seq[9]["applied"] is False)
+s, b = call("GET", "/batches/current")
+check("失败后批次仍open", s == 200 and b["batch_id"] == bid5)
+s, b = call("POST", f"/batches/{bid5}/abort")
+check("废弃失败批次", s == 200 and b["status"] == "aborted")
+s, outlets = call("GET", "/outlets")
+check("发布失败旧版照常供数", outlets["version"] == 3 and outlets["count"] == 8)
+
+# 15. /docs 与 openapi
 import urllib.request as u
 docs = u.urlopen(BASE + "/docs", timeout=5).status
 openapi = json.loads(u.urlopen(BASE + "/openapi.json", timeout=5).read().decode())
